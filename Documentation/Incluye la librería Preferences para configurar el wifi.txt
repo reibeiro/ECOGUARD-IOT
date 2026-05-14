@@ -1,0 +1,53 @@
+1. Incluye la librería Preferences
+Esta librería permite guardar datos en la memoria flash del ESP32 que no se borran al apagarlo.
+
+cpp
+#include <Preferences.h>
+Preferences preferences;
+2. Lógica para recibir y guardar (dentro de tu parser Bluetooth)
+Añade este caso dentro de tu función donde recibes mensajes por Serial Bluetooth:
+
+cpp
+// Si el mensaje empieza con "SET_WIFI:"
+if (message.startsWith("SET_WIFI:")) {
+    // 1. Quitar el prefijo
+    String data = message.substring(9); 
+    
+    // 2. Separar por comas (formato: ssid,pass,apikey)
+    int firstComma = data.indexOf(',');
+    int secondComma = data.indexOf(',', firstComma + 1);
+    
+    if (firstComma != -1 && secondComma != -1) {
+        String newSSID = data.substring(0, firstComma);
+        String newPASS = data.substring(firstComma + 1, secondComma);
+        String newKEY  = data.substring(secondComma + 1);
+        
+        // 3. Guardar en memoria permanente
+        preferences.begin("nvs", false);
+        preferences.putString("ssid", newSSID);
+        preferences.putString("pass", newPASS);
+        preferences.putString("apikey", newKEY);
+        preferences.end();
+        
+        Serial.println("Configuración recibida y guardada. Reiniciando...");
+        delay(2000);
+        ESP.restart(); // Reiniciar para aplicar cambios
+    }
+}
+
+3. Al inicio (en el setup)
+Debes cargar los datos guardados en lugar de usar los fijos:
+
+cpp
+void setup() {
+    preferences.begin("nvs", true); // Modo lectura
+    String savedSSID = preferences.getString("ssid", "WIFI_POR_DEFECTO");
+    String savedPASS = preferences.getString("pass", "PASS_POR_DEFECTO");
+    String savedKEY  = preferences.getString("apikey", "KEY_POR_DEFECTO");
+    preferences.end();
+    
+    // Ahora usa savedSSID, savedPASS y savedKEY para conectar al WiFi y ThingSpeak
+    WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+}
+//Con esto, tenemos un  sistema es completamente profesional e independiente: puedes llevar tu robot a cualquier oficina o evento, configurar el WiFi desde la APP y funcionará al instante.
+

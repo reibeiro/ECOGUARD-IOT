@@ -1,0 +1,26 @@
+# Arduino
+*.ino.cpp
+*.hex
+*.bin
+*.elf
+
+# VSCode
+.vscode/
+
+# Flutter
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# API Keys
+secrets.h
+config_private.h

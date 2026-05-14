@@ -1,0 +1,385 @@
+// ============================================================================
+// PROYECTO: Sistema Robotico Automatizado para Procesos Ambientales
+// AUTOR:    Reibeiro Velasquez Florez
+// VERSION:  V7.0.2 APP para configurar SSID, Password y API Keys de ThingSpeak en tiempo real.
+// ============================================================================
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include "BluetoothSerial.h"
+#include <ESP32Servo.h>
+#include <ESP32PWM.h>
+#include <WiFi.h>
+#include <ThingSpeak.h>
+#include <Preferences.h>
+#include "secrets.h"
+Preferences preferences;
+// ============================= CONSTANTES CIENTÍFICAS MQ-135 =================
+#define RL_VALUE             10.0      // kOhm
+#define VCC                  3.3       
+#define ADC_RESOLUTION       4095.0    
+#define RATIO_CLEAN_AIR      3.6       
+#define CO2_A                116.6020682
+#define CO2_B                -2.769034857
+// ============================= ESTADOS DE ALERTA =============================
+#define ALERTA_NORMAL    0
+#define ALERTA_OBSTACULO 1
+#define ALERTA_CRITICO   2
+#define ALERTA_GAS_ALTO  3
+#define ALERTA_LATERAL   4
+// ============================= VARIABLES DE RED DINÁMICAS ====================
+String WIFI_SSID_VAR  = SECRET_SSID;
+String WIFI_PASS_VAR  = SECRET_PASS;
+String TS_API_KEY_VAR = SECRET_WRITE_API_KEY;
+unsigned long THINGSPEAK_CHANNEL_ID = SECRET_CH_ID;
+// ============================= PINES =========================================
+#define DHTPIN          4
+#define DHTTYPE         DHT22
+#define MQ135_PIN       34
+#define LCD_ADDR        0x27
+const int IN1 = 14, IN2 = 27, IN3 = 26, IN4 = 25;
+const int ENA = 33, ENB = 32;
+const int MOTOR_CH_A = 6, MOTOR_CH_B = 7;
+const int TRIG_PIN = 5, ECHO_PIN = 18;
+const int BUZZER_PIN = 23, SERVO_PIN = 13;
+const int IR_OBS_IZQ_PIN = 16, IR_OBS_DER_PIN = 17;
+const int BTN_MODO_PIN = 19;
+// ============================= OBJETOS =======================================
+DHT dht(DHTPIN, DHTTYPE);
+BluetoothSerial SerialBT;
+LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
+Servo servoScanner;
+WiFiClient thingSpeakClient;
+// ============================= VARIABLES =====================================
+enum ModoOperacion { MODO_MANUAL = 0, MODO_AUTO };
+ModoOperacion modoActual = MODO_MANUAL;
+int velocidadPWM        = 180;
+int anguloServoActual   = 90;
+unsigned long tSensores   = 0;
+unsigned long tLCD        = 0;
+unsigned long tUltimaBT   = 0;
+unsigned long ultimoEnvioTS = 0;
+unsigned long tBoton      = 0;
+unsigned long tWiFi       = 0;
+unsigned long tUltimaAlertaObstaculo = 0;
+unsigned long tCalib      = 0;
+float temperaturaC      = 22.0;
+float humedadRH         = 55.0;
+float distanciaFrontal  = -1.0;
+int   mq135ADC          = 0;
+float Ro = 0, co2ppm = 400.0; 
+bool calibrado = false;
+long sumaADC = 0; int nCal = 0;
+int   alertaActual      = 0;
+const char* estadoMovimiento = "Detenido";
+bool buzzerGasActivo    = false;
+bool estadoBotonAnterior = HIGH;
+String ultimaAlerta     = "";
+// Nueva variable para buffer de configuracion
+String configBuffer = "";
+// ============================= FUNCIONES DE MEMORIA ==========================
+void cargarConfiguracion() {
+  preferences.begin("nvs", true); 
+  WIFI_SSID_VAR  = preferences.getString("ssid", SECRET_SSID);
+  WIFI_PASS_VAR  = preferences.getString("pass", SECRET_PASS);
+  TS_API_KEY_VAR = preferences.getString("apikey", SECRET_WRITE_API_KEY);
+  preferences.end();
+}
+void guardarConfiguracion(String s, String p, String k) {
+  preferences.begin("nvs", false);
+  preferences.putString("ssid", s);
+  preferences.putString("pass", p);
+  preferences.putString("apikey", k);
+  preferences.end();
+  SerialBT.println("ALERT:Configuracion Guardada. Reiniciando...");
+  delay(2000);
+  ESP.restart();
+}
+// ============================= FUNCIONES TÉCNICAS MQ-135 =====================
+float calcularRs(int adc) {
+  float v = (adc * VCC) / ADC_RESOLUTION;
+  if (v <= 0.1) v = 0.1; 
+  return RL_VALUE * ((VCC / v) - 1.0);
+}
+float calcularPPM(int adc) {
+  if (!calibrado || Ro <= 0) return 400.0;
+  float rs = calcularRs(adc);
+  float relacion = rs / Ro;
+  return CO2_A * pow(relacion, CO2_B);
+}
+// ============================================================================
+//                         BIENVENIDA CON SCROLL
+// ============================================================================
+void bienvenidaScroll() {
+  String l1 = "  Sistema Robotico Automatizado para Procesos Ambientales  ";
+  lcd.clear();
+  lcd.setCursor(0, 1); lcd.print("Autor: Reibeiro");
+  
+  for (int i = 0; i <= (int)(l1.length() - 16); i++) {
+    lcd.setCursor(0, 0);
+    lcd.print(l1.substring(i, i + 16));
+    delay(150); 
+    yield(); 
+  }
+  delay(500); lcd.clear();
+  lcd.setCursor(1,0); lcd.print("SISTEMA  LISTO");
+  delay(1200);
+  lcd.clear();
+}
+// ============================================================================
+//                         FUNCIONES DE MOTORES
+// ============================================================================
+void detenerMotores() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  ledcWriteChannel(MOTOR_CH_A, 0);
+  ledcWriteChannel(MOTOR_CH_B, 0);
+  estadoMovimiento = "Detenido";
+}
+void moverAdelante() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWriteChannel(MOTOR_CH_A, velocidadPWM);
+  ledcWriteChannel(MOTOR_CH_B, velocidadPWM);
+  estadoMovimiento = "Adelante";
+}
+void moverAtras() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  ledcWriteChannel(MOTOR_CH_A, velocidadPWM);
+  ledcWriteChannel(MOTOR_CH_B, velocidadPWM);
+  estadoMovimiento = "Atras";
+}
+void pivotarIzquierda() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWriteChannel(MOTOR_CH_A, velocidadPWM);
+  ledcWriteChannel(MOTOR_CH_B, velocidadPWM);
+  estadoMovimiento = "Pivot Izq";
+}
+void pivotarDerecha() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  ledcWriteChannel(MOTOR_CH_A, velocidadPWM);
+  ledcWriteChannel(MOTOR_CH_B, velocidadPWM);
+  estadoMovimiento = "Pivot Der";
+}
+// ============================================================================
+//                         SEGURIDAD Y ALERTAS
+// ============================================================================
+void enviarAlertaBT(String mensaje) {
+  if (mensaje != ultimaAlerta && (millis() - tUltimaAlertaObstaculo > 3000)) {
+    SerialBT.println("ALERT:" + mensaje);
+    ultimaAlerta = mensaje;
+    tUltimaAlertaObstaculo = millis();
+  }
+}
+void supervisorSeguridad() {
+  bool obsIzq = (digitalRead(IR_OBS_IZQ_PIN) == LOW);
+  bool obsDer = (digitalRead(IR_OBS_DER_PIN) == LOW);
+  int umbral = (modoActual == MODO_AUTO) ? 30 : 15;
+  bool frontal = (distanciaFrontal > 0 && distanciaFrontal < umbral);
+  if ( (frontal || obsIzq || obsDer) && (strcmp(estadoMovimiento, "Adelante") == 0) ) {
+    detenerMotores();
+    enviarAlertaBT("¡OBSTÁCULO! Detención de seguridad.");
+  } else {
+    if (!frontal && !obsIzq && !obsDer) {
+      if (ultimaAlerta == "¡OBSTÁCULO! Detención de seguridad.") ultimaAlerta = "";
+    }
+  }
+}
+void controlBuzzerPorGas() {
+  if (calibrado && co2ppm > 600) {
+    if (!buzzerGasActivo) {
+      ledcWriteTone(BUZZER_PIN, 2500);
+      buzzerGasActivo = true;
+      enviarAlertaBT("¡GAS DETECTADO! Alerta Activa.");
+    }
+  } else if (co2ppm < 540 && buzzerGasActivo) {
+    ledcWriteTone(BUZZER_PIN, 0);
+    buzzerGasActivo = false;
+    enviarAlertaBT("Ambiente normalizado. Seguro.");
+  }
+}
+// ============================================================================
+//                         LOGICA AUTOMATICA (BLINDADA)
+// ============================================================================
+void moverServoSuave(int anguloDestino) {
+  int paso = (anguloDestino > anguloServoActual) ? 5 : -5;
+  while (abs(anguloServoActual - anguloDestino) > 5) {
+    anguloServoActual += paso;
+    servoScanner.write(anguloServoActual);
+    delay(3); yield(); 
+  }
+  anguloServoActual = anguloDestino;
+  servoScanner.write(anguloServoActual);
+}
+float medirDistanciaCM() { 
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2); 
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10); 
+  digitalWrite(TRIG_PIN, LOW); 
+  long dur = pulseIn(ECHO_PIN, HIGH, 20000); 
+  return (dur == 0) ? -1.0 : dur * 0.0343 / 2.0; 
+}
+void ejecutarLogicaAuto() {
+  if (distanciaFrontal > 0 && distanciaFrontal < 30) {
+    detenerMotores();
+    delay(200); 
+    moverServoSuave(150); delay(100); float dI = medirDistanciaCM();
+    moverServoSuave(30);  delay(100); float dD = medirDistanciaCM();
+    moverServoSuave(90);  delay(50);
+    if (dI > dD) pivotarIzquierda(); else pivotarDerecha();
+    delay(450); 
+    detenerMotores();
+  } else {
+    moverAdelante();
+  }
+}
+// ============================================================================
+//                         PROCESAMIENTO BLUETOOTH 
+// ============================================================================
+void procesarBluetooth() {
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+    
+    // Nueva logica para tramas de configuracion (sin romper lo anterior)
+    if (c == 'S' && configBuffer == "") { // Inicio de SET_WIFI
+       configBuffer += c;
+    } else if (configBuffer.length() > 0) {
+       configBuffer += c;
+       if (c == '\n') { // Fin de trama
+          if (configBuffer.startsWith("SET_WIFI:")) {
+             String data = configBuffer.substring(9);
+             data.trim();
+             int c1 = data.indexOf(',');
+             int c2 = data.indexOf(',', c1 + 1);
+             if (c1 != -1 && c2 != -1) {
+                guardarConfiguracion(data.substring(0, c1), data.substring(c1+1, c2), data.substring(c2+1));
+             }
+          }
+          configBuffer = "";
+       }
+    }
+    
+    // Comandos originales intactos
+    if (c == 'S' || c == 's') { detenerMotores(); modoActual = MODO_MANUAL; enviarAlertaBT("STOP Manual."); }
+    else if (c == '1') velocidadPWM = 120;
+    else if (c == '5') velocidadPWM = 180;
+    else if (c == '9') velocidadPWM = 255;
+    else if (c == 'A' || c == 'a') { modoActual = MODO_AUTO; }
+    else if (c == 'M' || c == 'm') { modoActual = MODO_MANUAL; detenerMotores(); }
+    else if (modoActual == MODO_MANUAL) {
+      if (c == 'F') moverAdelante(); else if (c == 'B') moverAtras();
+      else if (c == 'L') pivotarIzquierda(); else if (c == 'R') pivotarDerecha();
+    }
+  }
+}
+// ============================================================================
+//                              SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200); Wire.begin(21, 22); lcd.init(); lcd.backlight();
+  dht.begin(); SerialBT.begin("Robot_Reibeiro_Pro");
+  
+  cargarConfiguracion(); // Cargar WIFI y API KEY de memoria
+  pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW); 
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); 
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+  pinMode(IR_OBS_IZQ_PIN, INPUT); pinMode(IR_OBS_DER_PIN, INPUT);
+  pinMode(BTN_MODO_PIN, INPUT_PULLUP);
+  ESP32PWM::allocateTimer(0);
+  servoScanner.setPeriodHertz(50);
+  servoScanner.attach(SERVO_PIN, 500, 2400);
+  ledcAttachChannel(ENA, 1000, 8, MOTOR_CH_A);
+  ledcAttachChannel(ENB, 1000, 8, MOTOR_CH_B);
+  ledcAttach(BUZZER_PIN, 2000, 8);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true); // El chip gestiona los reintentos internamente
+  WiFi.disconnect();
+  delay(500);
+  
+  Serial.print("Intentando conectar a SSID: ");
+  Serial.println(WIFI_SSID_VAR);
+  
+  WiFi.begin(WIFI_SSID_VAR.c_str(), WIFI_PASS_VAR.c_str());
+  ThingSpeak.begin(thingSpeakClient);
+  detenerMotores();
+  servoScanner.write(90);
+  
+  bienvenidaScroll();
+  tCalib = millis();
+}
+// ============================================================================
+//                              LOOP PRINCIPAL
+// ============================================================================
+void loop() {
+  if (!calibrado) {
+    unsigned long t = millis() - tCalib;
+    if (t < 30000) {
+      static unsigned long tl = 0;
+      if (millis() - tl > 1000) {
+        tl = millis(); sumaADC += analogRead(MQ135_PIN); nCal++;
+        lcd.setCursor(0,0); lcd.print("CALIBRANDO GAS");
+        lcd.setCursor(0,1); lcd.printf("AIRE:%02ds        ", 30-(t/1000));
+      }
+    } else {
+      Ro = calcularRs(sumaADC/nCal) / RATIO_CLEAN_AIR;
+      calibrado = true;
+      lcd.clear(); lcd.print("SISTEMA LISTO!"); delay(1000); lcd.clear();
+    }
+  }
+  // Eliminamos el bloque de reconexión manual que causaba saturación
+  // El ESP32 se reconectará solo gracias a setAutoReconnect(true) en el setup
+  
+  if (millis() - tSensores > 3000) { 
+    tSensores = millis(); 
+    float t = dht.readTemperature(); float h = dht.readHumidity(); 
+    if (!isnan(t) && t > 0) temperaturaC = t; 
+    if (!isnan(h) && h > 0) humedadRH = h; 
+  }
+  mq135ADC = analogRead(MQ135_PIN);
+  if (calibrado) co2ppm = calcularPPM(mq135ADC);
+  distanciaFrontal = medirDistanciaCM();
+  
+  procesarBluetooth();
+  
+  bool estado = digitalRead(BTN_MODO_PIN);
+  if (estadoBotonAnterior == HIGH && estado == LOW) { if (millis() - tBoton > 200) { tBoton = millis(); if (modoActual == MODO_MANUAL) modoActual = MODO_AUTO; else { modoActual = MODO_MANUAL; detenerMotores(); } } }
+  estadoBotonAnterior = estado;
+  if (modoActual == MODO_AUTO) ejecutarLogicaAuto();
+  supervisorSeguridad();
+  controlBuzzerPorGas();
+  // Estados de alerta
+  int obsIzq = (digitalRead(IR_OBS_IZQ_PIN) == LOW);
+  int obsDer = (digitalRead(IR_OBS_DER_PIN) == LOW);
+  if (co2ppm > 600) alertaActual = ALERTA_GAS_ALTO;
+  else if (distanciaFrontal > 0 && distanciaFrontal < 20) alertaActual = ALERTA_CRITICO;
+  else if (distanciaFrontal > 0 && distanciaFrontal < 35) alertaActual = ALERTA_OBSTACULO;
+  else if (obsIzq || obsDer) alertaActual = ALERTA_LATERAL;
+  else alertaActual = ALERTA_NORMAL;
+  if (millis() - ultimoEnvioTS > 25000 && WiFi.status() == WL_CONNECTED) {
+    ThingSpeak.setField(1, temperaturaC);
+    ThingSpeak.setField(2, humedadRH);
+    ThingSpeak.setField(3, (int)co2ppm);
+    ThingSpeak.setField(4, distanciaFrontal);
+    ThingSpeak.setField(5, (int)modoActual);
+    ThingSpeak.setField(6, alertaActual);
+    ThingSpeak.writeFields(THINGSPEAK_CHANNEL_ID, TS_API_KEY_VAR.c_str());
+    ultimoEnvioTS = millis();
+  }
+  if (millis() - tUltimaBT > 1200 && SerialBT.hasClient()) { 
+    tUltimaBT = millis(); 
+    SerialBT.printf("T:%.1f,H:%.1f,CO2:%.0f,D:%.1f,M:%s\n", temperaturaC, humedadRH, co2ppm, distanciaFrontal, estadoMovimiento); 
+  }
+  
+  if (calibrado && millis() - tLCD > 800) { 
+    tLCD = millis(); 
+    lcd.setCursor(0, 0); 
+    lcd.printf("%s %-10s", modoActual == MODO_AUTO ? "AUTO" : "MAN ", estadoMovimiento); 
+    lcd.setCursor(0, 1); 
+    lcd.printf("%.0fppm %.0fC %.0f%%   ", co2ppm, temperaturaC, humedadRH); 
+  }
+  
+  yield();
+}
